@@ -44,6 +44,13 @@ static struct
 
 static uint8_t current_buffer;
 static bool buffers_full;
+static bool buffer_ran_empty;
+static int beats_left;
+static int music_beat_position;
+
+static bool buffers_mixed;
+static int mixed_samples_left;
+signed short *final_samples;
 
 static int OrgVolume;
 
@@ -518,10 +525,7 @@ bool org_start(int startbeat)
 	SSSetVolume(ORG_CHANNEL, song.volume);
 	
 	// kickstart the first buffer
-	current_buffer = 0;
-	generate_music();
-	queue_final_buffer();
-	buffers_full = 0;				// tell org_run to generate the other buffer right away
+	kickstart_music_buffer();
 	
 	return 0;
 }
@@ -596,22 +600,24 @@ static void runfade()
 void c------------------------------() {}
 */
 
-// combines all of the individual channel output buffers into a single, final, buffer.
-static void mix_buffers(void)
+static void prepare_mix_buffers(void)
 {
-int i, cursample, len;
-int mixed_sample;
-signed short *final;
-
-//	lprintf("mix_buffers: mixing channels into final_buffer[%d]\n", current_buffer);
-	
+//	lprintf("mix_buffers: mixing channels into final_buffer[%d]\n", current_buffer)
 	// go up to samples*2 because we're mixing the stereo audio output from calls to WAV_Synth
-	len = buffer_samples * 2;
-	final = final_buffer[current_buffer].samples;
-	
-	//stat("mixing %d samples", len);
-	for(cursample=0;cursample<len;cursample++)
+	mixed_samples_left = buffer_samples * 2;
+	final_samples = final_buffer[current_buffer].samples;
+}
+
+// combines all of the individual channel output buffers into a single, final, buffer.
+static void mix_buffers(int samples_to_mix)
+{
+int work_to_do = mixed_samples_left - (samples_to_mix);
+int mixed_sample;
+
+//	uint32_t mix_start = SDL_GetTicks();
+	while(mixed_samples_left && mixed_samples_left > work_to_do)
 	{
+		//stat("mixing %d samples", samples_to_mix);
 		// first mix instruments
 		mixed_sample  = note_channel[0].outbuffer[cursample];
 		mixed_sample += note_channel[1].outbuffer[cursample];
@@ -630,10 +636,19 @@ signed short *final;
 		mixed_sample += note_channel[14].outbuffer[cursample];
 		mixed_sample += note_channel[15].outbuffer[cursample];
 		
+		// cap the sample in the range of 16-bits.
 		if (mixed_sample > 32767) mixed_sample = 32767;
 		else if (mixed_sample < -32768) mixed_sample = -32768;
-		
-		*final++ = mixed_sample;
+
+		*final_samples++ = mixed_sample;
+
+		mixed_samples_left--;
+	}
+//	stat("%d mix ", SDL_GetTicks() - mix_start);
+
+	if (mixed_samples_left == 0)
+	{
+		buffers_mixed = true; 		// we finished processing!
 	}
 }
 
@@ -645,13 +660,16 @@ static void queue_final_buffer(void)
 						current_buffer, OrgBufferFinished);
 	
 	current_buffer ^= 1;
+	//the new buffer needs to be filled and then mixed.
+	buffers_full = false;
+	buffers_mixed = false;
 }
 
 
 // callback from sslib when a buffer is finished playing.
 static void OrgBufferFinished(int channel, int buffer_no)
 {
-	buffers_full = false;
+	buffer_ran_empty = true;
 }
 
 /*
@@ -914,15 +932,38 @@ void org_run(void)
 	
 	// keep both buffers queued. if one of them isn't queued, then it's time to
 	// generate more music for it and queue it back on.
+	if (!buffers_mixed) //we check this first so we don't fill and mix buffers on the same frame. too laggy!
+	{
+		// TODO: generate different amounts based on how much time we have left
+		// more on low CPU frames, less on high CPU frames.
+		mix_buffers(40);				// mix more samples into the final buffer.
+	}
 	if (!buffers_full)
 	{
+		// TODO: generate different amounts based on how much time we have left
+		// more on low CPU frames, less on high CPU frames.
+		generate_music(40);				// generate more music into current_buffer
+		if (buffers_full)
+		{
+			prepare_mix_buffers();		// we have all information needed to mix now.
+		}
+	}
+
+	// if one buffer is has been used up, we need to switch to the other one.
+	if (buffer_ran_empty)
+	{
 //	    uint32_t start = SDL_GetTicks();
+		if (!buffers_full)
+		{
+			generate_music(beats_left);		// we ran out of time. do the rest of the work at once.
+			prepare_mix_buffers();			// mixing is always prepared after generating.
+		}
+		if (!buffers_mixed)
+		{
+			mix_buffers(mixed_samples_left);// we ran out of time. do the rest of the work at once.
+		}
 
-		generate_music();				// generate more music into current_buffer
-		
 		queue_final_buffer();			// enqueue current_buffer and switch buffers
-		buffers_full = true;			// both buffers full again until OrgBufferFinished called
-
 //		uint32_t totaltime = (SDL_GetTicks() - start);
 //		stat("%dms",totaltime);
 	}
@@ -930,16 +971,24 @@ void org_run(void)
 	if (song.fading) runfade();
 }
 
+static void kickstart_music_buffer(void)
+{
+	current_buffer = 0;
+	prepare_music();
+	generate_music(beats_left);		// generate a full buffer's worth of music at once.
+	prepare_mix_buffers();
+	mix_buffers(mixed_samples_left); // mix a full buffer's worth of samples all at once.
+	buffer_ran_empty = false;
+	queue_final_buffer();			// org_run will start to fill the other buffer as needed.
+}
 
-// generate a buffer's worth of music and place it in the current final buffer.
-static void generate_music(void)
+// prepare to begin filling the current final buffer.
+static void prepare_music(void)
 {
 int m;
-int beats_left;
-int out_position;
 
 	//stat("generate_music: cb=%d buffer_beats=%d", current_buffer, buffer_beats);
-	
+
 	// save beat # of the first beat in buffer for calculating current beat for TrackFuncs
 	final_buffer[current_buffer].firstbeat = song.beat;
 	
@@ -952,12 +1001,22 @@ int out_position;
 	
 	//stat("generate_music: generating %d beats of music\n", buffer_beats);
 	beats_left = buffer_beats;
-	out_position = 0;
+	music_beat_position = 0;
 
-//	uint32_t beat_start = SDL_GetTicks();
-	while(beats_left)
+}
+
+// generate a buffer's worth of music and place it in the current final buffer.
+static void generate_music(int beats_to_gen)
+{
+int m;
+int work_to_do = beats_left - beats_to_gen;
+//int beats_left;
+//int out_position;
+
+//	uint32_t beat_start = SDL_GetTicks();	
+	while(beats_left && beats_left > work_to_do)
 	{
-		out_position += song.samples_per_beat;
+		music_beat_position += song.samples_per_beat;
 		
 		// for each channel...
 		for(m=0;m<16;m++)
@@ -967,14 +1026,14 @@ int out_position;
 			// ensure that exactly one beat of samples was added to the channel by inserting silence
 			// if needed. sometimes NextBeat may not actually generate a full beats worth, for
 			// example if there was no note playing on the track, of if it was the last beat of a note.
-			ForceSamplePos(m, out_position);
+			ForceSamplePos(m, music_beat_position);
 		}
 		
 		if (++song.beat >= song.loop_end)
 		{
 			song.beat = song.loop_start;
 			song.haslooped = true;
-
+			
 			for(m=0;m<16;m++)
 			{
 				song.instrument[m].curnote = song.instrument[m].loop_note;
@@ -984,14 +1043,12 @@ int out_position;
 		
 		beats_left--;
 	}
-
 //	stat("%d beat", SDL_GetTicks() - beat_start);
-
-//	uint32_t start = SDL_GetTicks();
 	
-	mix_buffers();
-	
-//	stat("%d mix ", SDL_GetTicks() - start);
+	if (beats_left == 0)
+	{
+		buffers_full = true; 		// we finished processing!
+	}
 }
 
 
